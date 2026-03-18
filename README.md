@@ -1,8 +1,6 @@
-# Fireflaker
+# thing:
 
-Author: Allen W
-
-Fireflaker is a lightweight Windows-first surveillance ingestion toolchain built for dropped video files, not live NVR camera management.
+This is a lightweight Windows-first surveillance ingestion toolchain built for dropped video files, not live NVR camera management.
 
 It keeps CodeProject.AI as the inference backend and avoids rebuilding detection, ALPR, OCR, or face matching from scratch.
 
