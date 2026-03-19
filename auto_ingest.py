@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -47,6 +49,7 @@ from analyze_videos import (
 )
 
 TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
+DRIVE_REMOTE = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -194,6 +197,22 @@ def ensure_dirs(root: Path) -> dict[str, Path]:
     return paths
 
 
+def is_network_share_path(path: Path) -> bool:
+    path_str = str(path)
+    if path_str.startswith("\\\\"):
+        return True
+
+    anchor = path.anchor or os.path.splitdrive(path_str)[0]
+    if not anchor:
+        return False
+
+    try:
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(anchor)
+        return drive_type == DRIVE_REMOTE
+    except Exception:
+        return False
+
+
 def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
 
@@ -201,6 +220,12 @@ def is_video_file(path: Path) -> bool:
 def collect_candidates(watch_dir: Path, recursive: bool) -> list[Path]:
     iterator = watch_dir.rglob("*") if recursive else watch_dir.iterdir()
     return sorted(path for path in iterator if is_video_file(path))
+
+
+def collect_processing_candidates(processing_dir: Path) -> list[Path]:
+    if not processing_dir.exists():
+        return []
+    return sorted(path for path in processing_dir.iterdir() if is_video_file(path))
 
 
 def wait_for_file_ready(path: Path, stable_seconds: int, timeout_seconds: int) -> bool:
@@ -217,6 +242,15 @@ def wait_for_file_ready(path: Path, stable_seconds: int, timeout_seconds: int) -
         except OSError:
             time.sleep(1)
             continue
+
+        # Existing backlog files that have not changed for longer than the
+        # settle window can be accepted immediately.
+        if stat.st_size > 0 and (time.time() - stat.st_mtime) >= stable_seconds:
+            try:
+                with open(path, "rb"):
+                    return True
+            except OSError:
+                pass
 
         signature = (stat.st_size, stat.st_mtime_ns)
         if stat.st_size > 0 and signature == last_sig:
@@ -286,6 +320,63 @@ def derive_video_time(video_path: Path) -> datetime:
 
 def build_run_name(video_path: Path, video_time: datetime) -> str:
     return f"{video_time.strftime(TIME_FORMAT)}__{slugify(video_path.stem)}"
+
+
+def source_fingerprint(video_path: Path) -> dict[str, Any]:
+    stat = video_path.stat()
+    return {
+        "name": video_path.name,
+        "path": str(video_path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def load_failure_fingerprint(failure_dir: Path) -> dict[str, Any] | None:
+    meta_path = failure_dir / "source.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def should_skip_failed_source(video_path: Path, failed_root: Path) -> str | None:
+    current = source_fingerprint(video_path)
+    slug = slugify(video_path.stem)
+    for failure_dir in sorted(failed_root.glob(f"*__{slug}")):
+        if not failure_dir.is_dir():
+            continue
+        previous = load_failure_fingerprint(failure_dir)
+        if previous is not None:
+            if (
+                previous.get("name") == current["name"]
+                and previous.get("size") == current["size"]
+                and previous.get("mtime_ns") == current["mtime_ns"]
+            ):
+                return failure_dir.name
+            continue
+
+        failed_copy = failure_dir / video_path.name
+        if failed_copy.exists():
+            try:
+                failed_stat = failed_copy.stat()
+            except OSError:
+                continue
+            if failed_stat.st_size == current["size"]:
+                return failure_dir.name
+        for candidate in failure_dir.iterdir():
+            if not is_video_file(candidate):
+                continue
+            try:
+                failed_stat = candidate.stat()
+            except OSError:
+                continue
+            if failed_stat.st_size == current["size"]:
+                return failure_dir.name
+    return None
 
 
 def analyzer_args(args: argparse.Namespace, output_dir: Path) -> SimpleNamespace:
@@ -589,12 +680,33 @@ def move_with_unique_name(source: Path, destination_dir: Path, new_name: str | N
     return destination
 
 
+def ensure_video_readable(video_path: Path) -> None:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if total_frames <= 0 or width <= 0 or height <= 0:
+            raise RuntimeError(f"Unreadable or incomplete video metadata: {video_path}")
+    finally:
+        cap.release()
+
+
 def process_video_file(video_path: Path, args: argparse.Namespace, paths: dict[str, Path]) -> Path:
     ensure_cpai_available()
 
     source_time = derive_video_time(video_path)
     run_name = build_run_name(video_path, source_time)
-    processing_path = move_with_unique_name(video_path, paths["processing"], f"{run_name}{video_path.suffix.lower()}")
+    if video_path.parent == paths["processing"]:
+        processing_path = video_path
+    else:
+        processing_path = move_with_unique_name(
+            video_path,
+            paths["processing"],
+            f"{run_name}{video_path.suffix.lower()}",
+        )
     report_dir = paths["reports"] / run_name
     report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -604,6 +716,7 @@ def process_video_file(video_path: Path, args: argparse.Namespace, paths: dict[s
     clusterer = FaceClusterer(threshold=args.face_threshold)
 
     try:
+        ensure_video_readable(processing_path)
         clips = process_video(processing_path, analyzer, report_dir, clusterer, detections)
         local_to_global = sync_people_library(
             report_dir / "faces",
@@ -632,6 +745,8 @@ def process_video_file(video_path: Path, args: argparse.Namespace, paths: dict[s
         failure_target = unique_path(failure_dir / processing_path.name)
         if processing_path.exists():
             shutil.move(str(processing_path), str(failure_target))
+        with open(failure_dir / "source.json", "w", encoding="utf-8") as handle:
+            json.dump(source_fingerprint(video_path), handle, indent=2)
         with open(failure_dir / "error.txt", "w", encoding="utf-8") as handle:
             handle.write(traceback.format_exc())
         raise
@@ -643,6 +758,12 @@ def drain_pending(pending: set[Path], args: argparse.Namespace, paths: dict[str,
         if not path.exists() or not is_video_file(path):
             ready.append(path)
             continue
+        if path.parent != paths["processing"]:
+            existing_failure = should_skip_failed_source(path, paths["failed"])
+            if existing_failure is not None:
+                print(f"\nSkipping previously failed source {path} -> {existing_failure}")
+                ready.append(path)
+                continue
         if wait_for_file_ready(path, args.settle_seconds, args.settle_timeout):
             ready.append(path)
 
@@ -668,11 +789,24 @@ def main() -> int:
         print(f"Watch folder does not exist: {watch_dir}")
         return 1
 
+    if is_network_share_path(watch_dir):
+        if not args.force_polling:
+            args.force_polling = True
+            print(f"Network share detected at {watch_dir}; enabling polling watcher")
+        if args.settle_seconds < 30:
+            args.settle_seconds = 30
+            print(f"Network share detected at {watch_dir}; using settle_seconds={args.settle_seconds}")
+
     try:
         ensure_cpai_available()
     except Exception as exc:
         print(f"Cannot reach CodeProject.AI at {CPAI_URL}: {exc}")
         return 1
+
+    processing_pending = set(collect_processing_candidates(paths["processing"]))
+    if processing_pending:
+        print(f"Resuming {len(processing_pending)} processing file(s)")
+        drain_pending(processing_pending, args, paths)
 
     pending = set(collect_candidates(watch_dir, args.recursive))
     if pending:
